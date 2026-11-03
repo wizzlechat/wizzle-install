@@ -1,0 +1,333 @@
+diff --git a/src/channels/adapter.ts b/src/channels/adapter.ts
+index 2b430d5f..b818519c 100644
+--- a/src/channels/adapter.ts
++++ b/src/channels/adapter.ts
+@@ -113,6 +113,7 @@ export interface OutboundMessage {
+   kind: string;
+   content: unknown; // parsed JSON from messages_out
+   files?: OutboundFile[]; // file attachments from the session outbox
++  id?: string; // messages_out row id, when the host passes one
+ }
+ 
+ /** Discovered conversation info (from syncConversations). */
+diff --git a/src/channels/channel-registry.ts b/src/channels/channel-registry.ts
+index 692dde9d..67e0f032 100644
+--- a/src/channels/channel-registry.ts
++++ b/src/channels/channel-registry.ts
+@@ -106,12 +106,18 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
+       content: string,
+       files?: OutboundFile[],
+       instance?: string,
++      messageId?: string,
+     ): Promise<string | undefined> {
+       const adapter = getChannelAdapterExact(instance ?? channelType);
+       if (!adapter) {
+         throw new MissingChannelAdapterError(channelType, instance);
+       }
+-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
++      return adapter.deliver(platformId, threadId, {
++        kind,
++        content: JSON.parse(content),
++        files,
++        ...(messageId !== undefined && { id: messageId }),
++      });
+     },
+     async setTyping(
+       channelType: string,
+diff --git a/src/cli/resources/groups.ts b/src/cli/resources/groups.ts
+index 9879168d..8d0dbfe0 100644
+--- a/src/cli/resources/groups.ts
++++ b/src/cli/resources/groups.ts
+@@ -8,12 +8,18 @@ import {
+   type AdditionalMountConfig,
+   type McpServerConfig,
+ } from '../../container-config.js';
+-import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
++import { buildAgentGroupImage, isContainerRunning, killContainer } from '../../container-runner.js';
+ import { requestWake } from '../../request-wake.js';
+ import { restartAgentGroupContainers } from '../../container-restart.js';
+-import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
++import {
++  createAgentGroup,
++  getAgentGroup,
++  getAgentGroupByFolder,
++  setAgentGroupPaused,
++} from '../../db/agent-groups.js';
+ import { getDb, hasTable } from '../../db/connection.js';
+-import { getSession } from '../../db/sessions.js';
++import { getSession, getSessionsByAgentGroup } from '../../db/sessions.js';
++import { reconcileSession } from '../../reconcile-session.js';
+ import { writeSessionMessage } from '../../session-manager.js';
+ import {
+   getContainerConfig,
+@@ -412,6 +418,44 @@ registerResource({
+         return { restarted: count, rebuilt: !!args.rebuild };
+       },
+     },
++    pause: {
++      access: 'approval',
++      description:
++        'Pause a group. Use --id <group-id>. Stops every running container and keeps the group asleep: ' +
++        'messages from any channel and due tasks accumulate and run on resume. Pausing a paused group changes nothing.',
++      handler: async (args) => {
++        const id = args.id as string;
++        if (!id) throw new Error('--id is required');
++        if (!(await getAgentGroup(id))) throw new Error(`Agent group not found: ${id}`);
++        const changed = await setAgentGroupPaused(id, true);
++        let stopped = 0;
++        for (const session of await getSessionsByAgentGroup(id)) {
++          if (!isContainerRunning(session.id)) continue;
++          killContainer(session.id, 'paused via ncl');
++          stopped++;
++        }
++        return { id, paused: changed, stopped };
++      },
++    },
++    resume: {
++      access: 'approval',
++      description:
++        'Resume a paused group. Use --id <group-id>. Each active session with work that accumulated while paused ' +
++        'wakes once. Resuming a running group changes nothing.',
++      handler: async (args) => {
++        const id = args.id as string;
++        if (!id) throw new Error('--id is required');
++        if (!(await getAgentGroup(id))) throw new Error(`Agent group not found: ${id}`);
++        const changed = await setAgentGroupPaused(id, false);
++        let reconciled = 0;
++        for (const session of await getSessionsByAgentGroup(id)) {
++          if (session.status !== 'active') continue;
++          await reconcileSession(session.id);
++          reconciled++;
++        }
++        return { id, resumed: changed, reconciled };
++      },
++    },
+     'config get': {
+       access: 'open',
+       description: 'Show the container config for a group. Use --id <group-id>.',
+diff --git a/src/db/agent-groups.ts b/src/db/agent-groups.ts
+index 29f73fac..ef7d3af1 100644
+--- a/src/db/agent-groups.ts
++++ b/src/db/agent-groups.ts
+@@ -39,6 +39,18 @@ export async function updateAgentGroup(
+   await getDb().run(`UPDATE agent_groups SET ${fields.join(', ')} WHERE id = @id`, values);
+ }
+ 
++// Only stamps a running group, so a second pause keeps the first time; answers whether it changed.
++export async function setAgentGroupPaused(id: string, paused: boolean): Promise<boolean> {
++  const result = paused
++    ? await getDb().run(
++        'UPDATE agent_groups SET paused_at = ? WHERE id = ? AND paused_at IS NULL',
++        new Date().toISOString(),
++        id,
++      )
++    : await getDb().run('UPDATE agent_groups SET paused_at = NULL WHERE id = ? AND paused_at IS NOT NULL', id);
++  return result.changes > 0;
++}
++
+ export async function deleteAgentGroup(id: string): Promise<void> {
+   await getDb().run('DELETE FROM agent_groups WHERE id = ?', id);
+ }
+diff --git a/src/db/migrations/wizzle-agent-group-paused.ts b/src/db/migrations/wizzle-agent-group-paused.ts
+new file mode 100644
+index 00000000..8fac41fe
+--- /dev/null
++++ b/src/db/migrations/wizzle-agent-group-paused.ts
+@@ -0,0 +1,10 @@
++import type { Migration } from './index.js';
++
++// NULL means running; an ISO timestamp means paused since then, and nothing wakes the group.
++export const migrationWizzleAgentGroupPaused: Migration = {
++  version: 26,
++  name: 'wizzle-agent-group-paused',
++  async up(db) {
++    await db.exec(`ALTER TABLE agent_groups ADD COLUMN paused_at TEXT;`);
++  },
++};
+diff --git a/src/db/migrations/index.ts b/src/db/migrations/index.ts
+index 0e41129a..723e4af9 100644
+--- a/src/db/migrations/index.ts
++++ b/src/db/migrations/index.ts
+@@ -26,6 +26,7 @@ import { migration022 } from './022-messaging-group-detached.js';
+ import { migration023 } from './023-approvals-instance.js';
+ import { migration024 } from './024-host-coordination.js';
+ import { migration025 } from './025-container-config-speed.js';
++import { migrationWizzleAgentGroupPaused } from './wizzle-agent-group-paused.js';
+ 
+ interface MigrationBase {
+   version: number;
+@@ -93,6 +94,7 @@ export const migrations: Migration[] = [
+   migration023,
+   migration024,
+   migration025,
++  migrationWizzleAgentGroupPaused,
+ ];
+ 
+ /**
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+index 72fa6b3e..0b176c76 100644
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -13,7 +13,8 @@ CREATE TABLE agent_groups (
+   name             TEXT NOT NULL,
+   folder           TEXT NOT NULL UNIQUE,
+   agent_provider   TEXT,
+-  created_at       TEXT NOT NULL
++  created_at       TEXT NOT NULL,
++  paused_at        TEXT              -- NULL = running; set = paused, nothing wakes it
+ );
+ 
+ -- Platform groups/channels. unknown_sender_policy governs what happens
+diff --git a/src/delivery.ts b/src/delivery.ts
+index 9a41daba..e486df13 100644
+--- a/src/delivery.ts
++++ b/src/delivery.ts
+@@ -118,6 +118,8 @@ export interface ChannelDeliveryAdapter {
+     /** Delivering adapter instance (defaults to channelType downstream).
+      *  Host-internal only — containers never see instance. */
+     instance?: string,
++    /** The messages_out row id, for adapters that key messages by it. */
++    messageId?: string,
+   ): Promise<string | undefined>;
+   setTyping?(
+     channelType: string,
+@@ -546,6 +548,7 @@ async function deliverMessage(
+     deliveredContent,
+     files,
+     deliverInstance,
++    msg.id,
+   );
+   log.info('Message delivered', {
+     id: msg.id,
+diff --git a/src/mailbox/sqlite/index.ts b/src/mailbox/sqlite/index.ts
+index 5810720a..443aff2b 100644
+--- a/src/mailbox/sqlite/index.ts
++++ b/src/mailbox/sqlite/index.ts
+@@ -275,7 +275,7 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
+     getInboundHistory: (limit) =>
+       (
+         db
+-          .prepare('SELECT timestamp, kind, content FROM messages_in ORDER BY seq DESC LIMIT ?')
++          .prepare('SELECT id, timestamp, kind, content FROM messages_in ORDER BY seq DESC LIMIT ?')
+           .all(limit) as MailboxHistoryMessage[]
+       ).map((row) => ({ ...row, timestamp: sqliteTimestamp(row.timestamp) })),
+     getConversationRoot: () => {
+@@ -406,7 +406,7 @@ export function wrapSqliteOutbound(
+     getOutboundHistory: (limit) =>
+       (
+         readable()
+-          .prepare('SELECT timestamp, kind, content FROM messages_out ORDER BY seq DESC LIMIT ?')
++          .prepare('SELECT id, timestamp, kind, content FROM messages_out ORDER BY seq DESC LIMIT ?')
+           .all(limit) as MailboxHistoryMessage[]
+       ).map((row) => ({ ...row, timestamp: sqliteTimestamp(row.timestamp) })),
+     getTopLevelOutbound: (limit) =>
+diff --git a/src/mailbox/types.ts b/src/mailbox/types.ts
+index dbb546ba..42d1dae2 100644
+--- a/src/mailbox/types.ts
++++ b/src/mailbox/types.ts
+@@ -79,6 +79,7 @@ export interface RecurringMessage {
+ }
+ 
+ export interface MailboxHistoryMessage {
++  id: string;
+   timestamp: string;
+   kind: string;
+   content: string;
+diff --git a/src/modules/cross-session-context/backfill.test.ts b/src/modules/cross-session-context/backfill.test.ts
+index 25b58f1a..5d042b07 100644
+--- a/src/modules/cross-session-context/backfill.test.ts
++++ b/src/modules/cross-session-context/backfill.test.ts
+@@ -13,6 +13,7 @@
+ import { beforeEach, describe, expect, it, vi } from 'vitest';
+ 
+ type Row = { timestamp: string; content: string };
++type HistoryRow = Row & { id: string };
+ type Sibling = { root?: Row; outbound?: Row[] };
+ 
+ const written: Array<Record<string, unknown>> = [];
+@@ -23,7 +24,7 @@ const outboundSql: string[] = [];
+ 
+ let siblings: Record<string, Sibling> = {};
+ /** The target session's own inbound rows, newest first (getInboundHistory order). */
+-let targetHistory: Row[] = [];
++let targetHistory: HistoryRow[] = [];
+ let missingMailboxes = new Set<string>();
+ let brokenMailboxes = new Set<string>();
+ let recentSessions: Array<{
+@@ -256,7 +257,7 @@ describe('backfillSession — existing session', () => {
+   });
+ 
+   it('catches a cold session up from its newest row, with the idle label', async () => {
+-    targetHistory = [{ timestamp: iso(NOW - 48 * 60_000), content: chat('last thing I saw') }];
++    targetHistory = [{ id: 'in-last', timestamp: iso(NOW - 48 * 60_000), content: chat('last thing I saw') }];
+     siblings['sess-old'] = {
+       root: { timestamp: iso(NOW - 50 * 60_000), content: chat('already known opener') },
+       outbound: [
+diff --git a/src/reconcile-session.ts b/src/reconcile-session.ts
+index 41b6d2ff..45076347 100644
+--- a/src/reconcile-session.ts
++++ b/src/reconcile-session.ts
+@@ -158,7 +158,8 @@ async function reconcileActiveSession(session: Session): Promise<void> {
+     const exists = await withExistingMailboxSession(agentGroup.id, session.id, async (mailbox) => {
+       mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks());
+       dueCount = mailbox.countDueMessages();
+-      shouldWake = dueCount > 0 && !isContainerRunning(session.id);
++      // A paused group keeps its due rows for resume, which reconciles each session again.
++      shouldWake = dueCount > 0 && !isContainerRunning(session.id) && !agentGroup.paused_at;
+       if (!shouldWake) {
+         await maintainSessionMailbox(mailbox, session, agentGroup.id);
+       }
+diff --git a/src/router.ts b/src/router.ts
+index 35fc116d..8a4f70cd 100644
+--- a/src/router.ts
++++ b/src/router.ts
+@@ -371,6 +371,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
+   let engagedCount = 0;
+   let accumulatedCount = 0;
+   let subscribed = false;
++  const pausedGroups: string[] = [];
+ 
+   for (const agent of agents) {
+     const agentGroup = await getAgentGroup(agent.agent_group_id);
+@@ -399,6 +400,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
+     if (engages && accessOk && scopeOk) {
+       await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true);
+       engagedCount++;
++      if (agentGroup.paused_at) pausedGroups.push(agentGroup.id);
+ 
+       // Mention-sticky: ask the adapter to subscribe the thread so the
+       // platform's subscribed-message path carries follow-ups without
+@@ -442,6 +444,10 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
+     }
+   }
+ 
++  if (pausedGroups.length > 0) {
++    log.info('Message stored without wake, agent group paused', { agentGroupIds: pausedGroups });
++  }
++
+   if (engagedCount + accumulatedCount === 0) {
+     await recordDroppedMessage({
+       channel_type: event.channelType,
+@@ -641,7 +647,8 @@ async function deliverToAgent(
+     agentGroupName: agentGroup.name,
+   });
+ 
+-  if (wake) {
++  // A paused group keeps the row as a pending trigger, so resume runs it; only the wake is held.
++  if (wake && !agentGroup.paused_at) {
+     // Typing indicator + wake are only for the engaged branch; accumulated
+     // messages sit silently until a real trigger fires.
+     // Typing fires via the adapter instance that owns this chat's row.
+diff --git a/src/types.ts b/src/types.ts
+index ade18b18..89444700 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -7,6 +7,8 @@ export interface AgentGroup {
+   /** @deprecated Use container_configs.provider instead. */
+   agent_provider: string | null;
+   created_at: string;
++  /** ISO time the group was paused, NULL while running. */
++  paused_at?: string | null;
+ }
+ 
+ /**
