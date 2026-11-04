@@ -7,7 +7,7 @@ version="${1:-}"
 runtime="${2:-nanoclaw}"
 fork_skill="${WIZZLE_FORK_SKILL:-$HOME/Workspace/nanoclaw/.claude/skills/add-wizzle}"
 openclaw_dir="${WIZZLE_OPENCLAW:-$here/../wizzle-openclaw}"
-site="${WIZZLE_SITE:-$here/../wizzle-site}"
+site="${WIZZLE_SITE:-$here/../wizzle-site/public}"
 
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ ! "$runtime" =~ ^(nanoclaw|openclaw)$ ]]; then
   echo 'Usage: ./build.sh <version> [nanoclaw|openclaw], for example ./build.sh 0.1.0 openclaw' >&2
